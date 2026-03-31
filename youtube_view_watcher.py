@@ -9,7 +9,6 @@ from typing import Optional
 from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import urlopen
 
-
 YOUTUBE_API_URL = "https://www.googleapis.com/youtube/v3/videos"
 OSC_NEW_VIEWS_ADDRESS = "/newviews"
 OSC_VIEW_CHECK_ADDRESS = "/viewcheck"
@@ -48,25 +47,31 @@ def extract_video_id(video_url: str) -> str:
     raise ValueError(f"Could not extract a video ID from URL: {video_url}")
 
 
-def fetch_view_count(api_key: str, video_id: str) -> int:
-    query = (
-        f"{YOUTUBE_API_URL}?"
-        f"{urlencode({'part': 'statistics', 'id': video_id, 'key': api_key})}"
-    )
+# MODIFIED: Now accepts a list of IDs and returns a dictionary of {id: views}
+def fetch_view_counts(api_key: str, video_ids: list[str]) -> dict[str, int]:
+    if not video_ids:
+        return {}
+
+    # Join the IDs with commas for a single batched API call
+    ids_param = ",".join(video_ids)
+
+    query = f"{YOUTUBE_API_URL}?{urlencode({'part': 'statistics', 'id': ids_param, 'key': api_key})}"
 
     with urlopen(query, timeout=10) as response:
         payload = json.load(response)
 
     items = payload.get("items", [])
-    if not items:
-        raise ValueError("Video not found or API key does not have access.")
 
-    statistics = items[0].get("statistics", {})
-    view_count = statistics.get("viewCount")
-    if view_count is None:
-        raise ValueError("YouTube API response did not include viewCount.")
+    # Map video ID to its view count
+    results = {}
+    for item in items:
+        v_id = item.get("id")
+        statistics = item.get("statistics", {})
+        view_count = statistics.get("viewCount")
+        if v_id and view_count is not None:
+            results[v_id] = int(view_count)
 
-    return int(view_count)
+    return results
 
 
 def discover_broadcast_ip() -> str:
@@ -79,7 +84,9 @@ def discover_broadcast_ip() -> str:
 
     octets = local_ip.split(".")
     if len(octets) != 4:
-        raise ValueError(f"Could not determine a valid IPv4 address from {local_ip}")
+        raise ValueError(
+            f"Could not determine a valid IPv4 address from {local_ip}"
+        )
 
     octets[-1] = "255"
     return ".".join(octets)
@@ -92,7 +99,9 @@ def _osc_pad(data: bytes) -> bytes:
 
 def build_osc_message(address: str, value: int) -> bytes:
     if not -(2**31) <= value < 2**31:
-        raise ValueError("OSC integer value must fit in a 32-bit signed integer")
+        raise ValueError(
+            "OSC integer value must fit in a 32-bit signed integer"
+        )
 
     address_part = _osc_pad(address.encode("utf-8") + b"\x00")
     type_tag_part = _osc_pad(b",i\x00")
@@ -100,7 +109,9 @@ def build_osc_message(address: str, value: int) -> bytes:
     return address_part + type_tag_part + value_part
 
 
-def send_osc_broadcast(address: str, value: int, broadcast_ip: str, port: int) -> None:
+def send_osc_broadcast(
+    address: str, value: int, broadcast_ip: str, port: int
+) -> None:
     packet = build_osc_message(address, value)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     try:
@@ -110,48 +121,82 @@ def send_osc_broadcast(address: str, value: int, broadcast_ip: str, port: int) -
         sock.close()
 
 
-def watch_video(
+# MODIFIED: Now iterates through multiple videos and handles OSC mapping
+def watch_videos(
     api_key: str,
-    video_url: str,
+    video_urls: list[str],
     port: int,
     interval_seconds: float,
     broadcast_ip: Optional[str],
 ) -> None:
-    video_id = extract_video_id(video_url)
-    target_ip = broadcast_ip or discover_broadcast_ip()
-    last_count: Optional[int] = None
+    # Extract IDs for all URLs
+    video_ids = [extract_video_id(url) for url in video_urls]
 
-    print(f"Watching video {video_id}")
+    # API hard limit is 50 per request
+    if len(video_ids) > 50:
+        print(
+            "⚠️ Warning: YouTube API limits batching to 50 videos. Only tracking the first 50."
+        )
+        video_ids = video_ids[:50]
+
+    target_ip = broadcast_ip or discover_broadcast_ip()
+
+    # Dictionary to keep track of previous view counts for each video
+    last_counts: dict[str, int] = {}
+
+    print(f"Watching {len(video_ids)} videos...")
     print(
-        f"OSC target: {target_ip}:{port} "
-        f"({OSC_NEW_VIEWS_ADDRESS}, {OSC_VIEW_CHECK_ADDRESS})"
+        f"OSC target: {target_ip}:{port} ({OSC_NEW_VIEWS_ADDRESS}, {OSC_VIEW_CHECK_ADDRESS})"
     )
     print(f"Poll interval: {interval_seconds} seconds")
 
     while True:
         try:
-            current_count = fetch_view_count(api_key, video_id)
+            current_counts = fetch_view_counts(api_key, video_ids)
 
-            if last_count is None:
-                send_osc_broadcast(OSC_VIEW_CHECK_ADDRESS, 0, target_ip, port)
-                print(f"Initial views: {current_count}")
-            elif current_count > last_count:
-                delta = current_count - last_count
-                send_osc_broadcast(OSC_NEW_VIEWS_ADDRESS, delta, target_ip, port)
-                send_osc_broadcast(OSC_VIEW_CHECK_ADDRESS, 1, target_ip, port)
-                print(
-                    f"new views: {delta} (total: {current_count}) -> sent OSC broadcasts"
-                )
-            elif current_count == last_count:
-                send_osc_broadcast(OSC_VIEW_CHECK_ADDRESS, 0, target_ip, port)
-                print("same views")
-            else:
-                send_osc_broadcast(OSC_VIEW_CHECK_ADDRESS, 0, target_ip, port)
-                print(
-                    f"view count decreased from {last_count} to {current_count}; skipping broadcast"
-                )
+            for v_id in video_ids:
+                current_count = current_counts.get(v_id)
 
-            last_count = current_count
+                if current_count is None:
+                    print(
+                        f"[{v_id}] Not found or API key does not have access."
+                    )
+                    continue
+
+                last_count = last_counts.get(v_id)
+
+                if last_count is None:
+                    send_osc_broadcast(
+                        OSC_VIEW_CHECK_ADDRESS, 0, target_ip, port
+                    )
+                    print(f"[{v_id}] Initial views: {current_count}")
+                elif current_count > last_count:
+                    delta = current_count - last_count
+                    send_osc_broadcast(
+                        OSC_NEW_VIEWS_ADDRESS, delta, target_ip, port
+                    )
+                    send_osc_broadcast(
+                        OSC_VIEW_CHECK_ADDRESS, 1, target_ip, port
+                    )
+                    print(
+                        f"[{v_id}] new views: {delta} (total: {current_count}) -> sent OSC broadcasts"
+                    )
+                elif current_count == last_count:
+                    send_osc_broadcast(
+                        OSC_VIEW_CHECK_ADDRESS, 0, target_ip, port
+                    )
+                    print(f"[{v_id}] same views")
+                else:
+                    send_osc_broadcast(
+                        OSC_VIEW_CHECK_ADDRESS, 0, target_ip, port
+                    )
+                    print(
+                        f"[{v_id}] view count decreased from {last_count} to {current_count}; skipping broadcast"
+                    )
+
+                # Save the new count for the next loop
+                last_counts[v_id] = current_count
+
         except KeyboardInterrupt:
             print("\nStopped.")
             return
@@ -161,26 +206,34 @@ def watch_video(
         time.sleep(interval_seconds)
 
 
+# MODIFIED: Changed video_url to video_urls with nargs='+'
 def parse_args() -> argparse.Namespace:
     def positive_float(value: str) -> float:
         parsed = float(value)
         if parsed <= 0:
-            raise argparse.ArgumentTypeError("interval must be greater than 0")
+            raise argparse.ArgumentTypeError(
+                "interval must be greater than 0"
+            )
         return parsed
 
     def udp_port(value: str) -> int:
         parsed = int(value)
         if not 1 <= parsed <= 65535:
-            raise argparse.ArgumentTypeError("port must be between 1 and 65535")
+            raise argparse.ArgumentTypeError(
+                "port must be between 1 and 65535"
+            )
         return parsed
 
     parser = argparse.ArgumentParser(
         description=(
-            "Poll a YouTube video's view count and broadcast OSC messages for "
+            "Poll multiple YouTube videos' view counts and broadcast OSC messages for "
             "new-view deltas and per-check status."
         )
     )
-    parser.add_argument("video_url", help="YouTube video URL to watch")
+    # Changed here: accepts 1 or more URLs separated by spaces
+    parser.add_argument(
+        "video_urls", nargs="+", help="YouTube video URLs to watch (space-separated)"
+    )
     parser.add_argument(
         "--api-key",
         default=os.environ.get("YOUTUBE_API_KEY"),
@@ -213,9 +266,9 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
-    watch_video(
+    watch_videos(
         api_key=args.api_key,
-        video_url=args.video_url,
+        video_urls=args.video_urls,
         port=args.port,
         interval_seconds=args.interval,
         broadcast_ip=args.broadcast_ip,
