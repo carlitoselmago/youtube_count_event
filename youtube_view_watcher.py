@@ -154,6 +154,9 @@ def watch_videos(
         try:
             current_counts = fetch_view_counts(api_key, video_ids)
 
+            total_delta = 0
+            any_new_views = False
+
             for v_id in video_ids:
                 current_count = current_counts.get(v_id)
 
@@ -166,36 +169,30 @@ def watch_videos(
                 last_count = last_counts.get(v_id)
 
                 if last_count is None:
-                    send_osc_broadcast(
-                        OSC_VIEW_CHECK_ADDRESS, 0, target_ip, port
-                    )
                     print(f"[{v_id}] Initial views: {current_count}")
                 elif current_count > last_count:
                     delta = current_count - last_count
-                    send_osc_broadcast(
-                        OSC_NEW_VIEWS_ADDRESS, delta, target_ip, port
-                    )
-                    send_osc_broadcast(
-                        OSC_VIEW_CHECK_ADDRESS, 1, target_ip, port
-                    )
-                    print(
-                        f"[{v_id}] new views: {delta} (total: {current_count}) -> sent OSC broadcasts"
-                    )
+                    total_delta += delta
+                    any_new_views = True
+                    print(f"[{v_id}] new views: +{delta} (total: {current_count})")
                 elif current_count == last_count:
-                    send_osc_broadcast(
-                        OSC_VIEW_CHECK_ADDRESS, 0, target_ip, port
-                    )
                     print(f"[{v_id}] same views")
                 else:
-                    send_osc_broadcast(
-                        OSC_VIEW_CHECK_ADDRESS, 0, target_ip, port
-                    )
                     print(
-                        f"[{v_id}] view count decreased from {last_count} to {current_count}; skipping broadcast"
+                        f"[{v_id}] view count decreased from {last_count} to {current_count}"
                     )
 
                 # Save the new count for the next loop
                 last_counts[v_id] = current_count
+
+            # Send a single OSC message for the entire batch
+            if any_new_views:
+                send_osc_broadcast(OSC_NEW_VIEWS_ADDRESS, total_delta, target_ip, port)
+                send_osc_broadcast(OSC_VIEW_CHECK_ADDRESS, 1, target_ip, port)
+                print(f"-> OSC broadcast: {OSC_NEW_VIEWS_ADDRESS}={total_delta}, {OSC_VIEW_CHECK_ADDRESS}=1")
+            elif last_counts:
+                send_osc_broadcast(OSC_VIEW_CHECK_ADDRESS, 0, target_ip, port)
+                print(f"-> OSC broadcast: {OSC_VIEW_CHECK_ADDRESS}=0")
 
         except KeyboardInterrupt:
             print("\nStopped.")
